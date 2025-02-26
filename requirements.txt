@@ -23,7 +23,7 @@ python-magic>=0.4.27     # For Unix-like systems
 openai>=1.10.0
 
 # Web Search
-google-search-results>=2.4.2  # SerpAPI
+google-search-results>=2.4.2 
 
 # Utilities
 python-dotenv>=1.0.0
