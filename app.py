@@ -20,8 +20,11 @@ import config
 # Set up environment variables
 # LangChain environment variables will be set from config.py which loads from .env
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
-os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
+# Make sure environment variables are strings, not None
+if config.LANGCHAIN_API_KEY:
+    os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
+if config.LANGCHAIN_PROJECT:
+    os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 
 # Azure Blob Storage Setup
