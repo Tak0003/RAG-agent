@@ -35,7 +35,12 @@ AZURE_SEARCH_KEY = get_config("azure_search", "key", "AZURE_SEARCH_KEY")
 AZURE_SEARCH_INDEX = get_config("azure_search", "index", "AZURE_SEARCH_INDEX", "azureblob-index")
 
 # LangSmith Configuration
-LANGCHAIN_TRACING_V2_STR = get_config("langchain", "tracing_v2", "LANGCHAIN_TRACING_V2", "true")
-LANGCHAIN_TRACING_V2 = LANGCHAIN_TRACING_V2_STR.lower() == "true"
+tracing_v2_value = get_config("langchain", "tracing_v2", "LANGCHAIN_TRACING_V2", "true")
+# Handle both boolean and string values
+if isinstance(tracing_v2_value, bool):
+    LANGCHAIN_TRACING_V2 = tracing_v2_value
+else:
+    LANGCHAIN_TRACING_V2 = str(tracing_v2_value).lower() == "true"
+
 LANGCHAIN_API_KEY = get_config("langchain", "api_key", "LANGCHAIN_API_KEY")
 LANGCHAIN_PROJECT = get_config("langchain", "project", "LANGCHAIN_PROJECT", "corrective-rag-demo")
