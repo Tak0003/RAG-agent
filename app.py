@@ -19,17 +19,25 @@ import config
 
 # Set up environment variables
 # LangChain environment variables will be set from config.py which loads from .env
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-# Make sure environment variables are strings, not None
+if config.LANGCHAIN_TRACING_V2:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
 if config.LANGCHAIN_API_KEY:
     os.environ["LANGCHAIN_API_KEY"] = config.LANGCHAIN_API_KEY
 if config.LANGCHAIN_PROJECT:
     os.environ["LANGCHAIN_PROJECT"] = config.LANGCHAIN_PROJECT
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 
-# Azure Blob Storage Setup
-blob_service_client = BlobServiceClient.from_connection_string(config.AZURE_BLOB_CONNECTION_STRING)
-container_client = blob_service_client.get_container_client(config.AZURE_BLOB_CONTAINER)
+# Initialize Azure Blob Storage with proper error handling
+container_client = None
+try:
+    if config.AZURE_BLOB_CONNECTION_STRING:
+        # Azure Blob Storage Setup
+        blob_service_client = BlobServiceClient.from_connection_string(config.AZURE_BLOB_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(config.AZURE_BLOB_CONTAINER)
+    else:
+        st.warning("Blob Storage connection string is not configured. File upload functionality will be disabled.")
+except Exception as e:
+    st.error(f"Failed to initialize Azure Blob Storage: {str(e)}")
 
 # Supported file types
 SUPPORTED_TYPES = [
@@ -49,25 +57,51 @@ class GraphState(TypedDict):
     original_question: str  # Added to store the original question when transforming queries
 
 
-llm = AzureChatOpenAI(
-    openai_api_version=config.AZURE_OPENAI_API_VERSION,
-    azure_deployment=config.AZURE_OPENAI_DEPLOYMENT,
-    azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
-    api_key=config.AZURE_OPENAI_API_KEY,
-    tags=["corrective-rag"]
-)
+# Initialize LLM with proper error handling
+try:
+    if config.AZURE_OPENAI_API_KEY and config.AZURE_OPENAI_ENDPOINT:
+        llm = AzureChatOpenAI(
+            openai_api_version=config.AZURE_OPENAI_API_VERSION,
+            azure_deployment=config.AZURE_OPENAI_DEPLOYMENT,
+            azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+            api_key=config.AZURE_OPENAI_API_KEY,
+            tags=["corrective-rag"]
+        )
+    else:
+        st.error("Azure OpenAI API key or endpoint is not configured. The application will not function correctly.")
+        llm = None
+except Exception as e:
+    st.error(f"Failed to initialize Azure OpenAI: {str(e)}")
+    llm = None
 
-retriever = AzureCognitiveSearchRetriever(
-    service_name="yamanaka-agent-test",
-    api_key=config.AZURE_SEARCH_KEY,
-    index_name=config.AZURE_SEARCH_INDEX,
-    content_key="content",
-    top_k=3,
-)
+# Initialize Azure Cognitive Search retriever with proper error handling
+try:
+    if config.AZURE_SEARCH_ENDPOINT and config.AZURE_SEARCH_KEY:
+        retriever = AzureCognitiveSearchRetriever(
+            service_name="yamanaka-agent-test",
+            api_key=config.AZURE_SEARCH_KEY,
+            index_name=config.AZURE_SEARCH_INDEX,
+            content_key="content",
+            top_k=3,
+        )
+    else:
+        st.warning("Azure Cognitive Search endpoint or key is not configured. Document retrieval will not work.")
+        retriever = None
+except Exception as e:
+    st.error(f"Failed to initialize Azure Cognitive Search: {str(e)}")
+    retriever = None
 
 
 def upload_file_to_blob(uploaded_file, file_type):
     """Upload a file to Azure Blob Storage."""
+    # Check if container_client is properly initialized
+    if container_client is None:
+        return {
+            "status": "error",
+            "message": "Azure Blob Storage is not properly configured. File upload is disabled.",
+            "blob_name": None
+        }
+
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         blob_name = f"{timestamp}_{uploaded_file.name}"
@@ -100,69 +134,94 @@ def retrieve(state: GraphState) -> dict:
     with st.spinner('ドキュメント検索中...'):
         question = state["question"]
 
-        # Get documents from the retriever
-        documents = retriever.get_relevant_documents(question)
+        # Check if retriever is properly initialized
+        if retriever is None:
+            st.error("Azure Cognitive Search retriever is not configured. Document retrieval is disabled.")
+            return {
+                "documents": [],
+                "question": question
+            }
 
-        # Extract filenames and add useful metadata
-        filenames = []
-        for doc in documents:
-            if 'source' in doc.metadata:
-                filename = doc.metadata['source']
-                filenames.append(filename)
-                # Set source_type to 'blob' for all retrieved documents from Azure Cognitive Search
-                # This is critical for proper categorization in the generate function
-                doc.metadata['source_type'] = 'blob'
+        try:
+            # Get documents from the retriever
+            documents = retriever.get_relevant_documents(question)
 
-                # Check if filename contains any terms from the query
-                # This will help with evaluation later
-                query_terms = question.lower().split()
-                if any(term.lower() in filename.lower() for term in query_terms):
-                    doc.metadata['filename_match'] = True
+            # Extract filenames and add useful metadata
+            filenames = []
+            for doc in documents:
+                if 'source' in doc.metadata:
+                    filename = doc.metadata['source']
+                    filenames.append(filename)
+                    # Set source_type to 'blob' for all retrieved documents from Azure Cognitive Search
+                    # This is critical for proper categorization in the generate function
+                    doc.metadata['source_type'] = 'blob'
+
+                    # Check if filename contains any terms from the query
+                    # This will help with evaluation later
+                    query_terms = question.lower().split()
+                    if any(term.lower() in filename.lower() for term in query_terms):
+                        doc.metadata['filename_match'] = True
+                    else:
+                        doc.metadata['filename_match'] = False
+
                 else:
+                    # Ensure all documents have source_type even if they don't have source
+                    doc.metadata['source_type'] = 'blob'
+                    doc.metadata['source'] = 'Unknown'
                     doc.metadata['filename_match'] = False
 
-            else:
-                # Ensure all documents have source_type even if they don't have source
-                doc.metadata['source_type'] = 'blob'
-                doc.metadata['source'] = 'Unknown'
-                doc.metadata['filename_match'] = False
+                # Add search score as part of metadata if available
+                if '@search.score' in doc.metadata:
+                    doc.metadata['search_score'] = doc.metadata['@search.score']
 
-            # Add search score as part of metadata if available
-            if '@search.score' in doc.metadata:
-                doc.metadata['search_score'] = doc.metadata['@search.score']
+            if debug_mode:
+                st.write(f"検索されたドキュメント数: {len(documents)}")
+                if documents:
+                    st.write("### 検索されたドキュメント:")
+                    for i, doc in enumerate(documents, 1):
+                        st.write(f"\n**Document {i}:**")
+                        source_name = doc.metadata.get('source', 'Unknown')
+                        st.write(f"Source: {source_name}")
+                        st.write(
+                            f"Source Type: {doc.metadata.get('source_type', 'Not specified')}")  # Add this line for debugging
 
-        if debug_mode:
-            st.write(f"検索されたドキュメント数: {len(documents)}")
-            if documents:
-                st.write("### 検索されたドキュメント:")
-                for i, doc in enumerate(documents, 1):
-                    st.write(f"\n**Document {i}:**")
-                    source_name = doc.metadata.get('source', 'Unknown')
-                    st.write(f"Source: {source_name}")
-                    st.write(
-                        f"Source Type: {doc.metadata.get('source_type', 'Not specified')}")  # Add this line for debugging
+                        if doc.metadata.get('filename_match', False):
+                            st.write("⭐ **ファイル名が検索クエリと一致**")
 
-                    if doc.metadata.get('filename_match', False):
-                        st.write("⭐ **ファイル名が検索クエリと一致**")
+                        if '@search.score' in doc.metadata:
+                            st.write(f"Score: {doc.metadata['@search.score']}")
 
-                    if '@search.score' in doc.metadata:
-                        st.write(f"Score: {doc.metadata['@search.score']}")
+                        st.write(f"Content (前200文字): {doc.page_content[:200]}...")
+                        st.write(f"Metadata: {doc.metadata}")
+                else:
+                    st.write("⚠️ ドキュメントが見つかりませんでした")
 
-                    st.write(f"Content (前200文字): {doc.page_content[:200]}...")
-                    st.write(f"Metadata: {doc.metadata}")
-            else:
-                st.write("⚠️ ドキュメントが見つかりませんでした")
+                st.write("### 検索されたファイル名:")
+                st.write(filenames)
 
-            st.write("### 検索されたファイル名:")
-            st.write(filenames)
+            return {"documents": documents, "question": question}
 
-        return {"documents": documents, "question": question}
+        except Exception as e:
+            st.error(f"ドキュメント検索中にエラーが発生しました: {str(e)}")
+            return {
+                "documents": [],
+                "question": question
+            }
 
 
 def grade_documents(state: GraphState) -> dict:
     with st.spinner('関連性を評価中...'):
         question = state["question"]
         documents = state["documents"]
+
+        # If llm is not initialized, skip grading
+        if llm is None:
+            st.error("LLMが初期化されていないため、ドキュメント評価をスキップします。")
+            return {
+                "documents": documents,
+                "question": question,
+                "search_results": "No"
+            }
 
         # First, prioritize documents with filename matches
         filename_matches = []
@@ -347,6 +406,15 @@ def transform_query(state: GraphState) -> dict:
         question = state["question"]
         documents = state["documents"]
 
+        # Check if LLM is initialized
+        if llm is None:
+            st.error("LLMが初期化されていないため、クエリ変換をスキップします。")
+            return {
+                "documents": documents,
+                "question": question,
+                "original_question": question
+            }
+
         # CRAG-inspired query transformation
         transform_prompt = ChatPromptTemplate.from_messages([
             ("system", """あなたは検索に最適化された質問を生成するエキスパートです。
@@ -366,20 +434,29 @@ def transform_query(state: GraphState) -> dict:
             検索用に最適化された質問を生成してください:""")
         ])
 
-        # Generate optimized query
-        response = transform_prompt | llm | StrOutputParser()
-        optimized_query = response.invoke({"question": question})
+        try:
+            # Generate optimized query
+            response = transform_prompt | llm | StrOutputParser()
+            optimized_query = response.invoke({"question": question})
 
-        if debug_mode:
-            st.write("### クエリ最適化")
-            st.write(f"元のクエリ: {question}")
-            st.write(f"最適化されたクエリ: {optimized_query}")
+            if debug_mode:
+                st.write("### クエリ最適化")
+                st.write(f"元のクエリ: {question}")
+                st.write(f"最適化されたクエリ: {optimized_query}")
 
-        return {
-            "documents": documents,
-            "question": optimized_query,
-            "original_question": question  # Store the original question
-        }
+            return {
+                "documents": documents,
+                "question": optimized_query,
+                "original_question": question  # Store the original question
+            }
+        except Exception as e:
+            st.error(f"クエリ最適化中にエラーが発生しました: {str(e)}")
+            # Return original query if optimization fails
+            return {
+                "documents": documents,
+                "question": question,
+                "original_question": question
+            }
 
 
 def web_search_fn(state: GraphState) -> dict:  # Renamed function from web_search to web_search_fn
@@ -471,6 +548,15 @@ def generate(state: GraphState) -> dict:
     with st.spinner('回答を生成中...'):
         question = state["question"]
         documents = state["documents"]
+
+        # Check if LLM is initialized
+        if llm is None:
+            st.error("LLMが初期化されていないため、回答を生成できません。")
+            return {
+                "documents": documents,
+                "question": question,
+                "generation": "申し訳ありませんが、必要なサービスが設定されていないため回答を生成できません。"
+            }
 
         # Debug documents before categorization
         if debug_mode:
@@ -564,25 +650,33 @@ def generate(state: GraphState) -> dict:
                 "generation": "申し訳ありませんが、質問に関連する情報が見つかりませんでした。"
             }
 
-        # Generate context for the prompt
-        context = "\n\n".join([doc.page_content for doc in context_docs])
+        try:
+            # Generate context for the prompt
+            context = "\n\n".join([doc.page_content for doc in context_docs])
 
-        if debug_mode:
-            st.write("### コンテキスト内容")
-            st.write(context[:500] + "..." if len(context) > 500 else context)
+            if debug_mode:
+                st.write("### コンテキスト内容")
+                st.write(context[:500] + "..." if len(context) > 500 else context)
 
-        # Generate the answer
-        generation_chain = prompt | llm | StrOutputParser()
-        generation = generation_chain.invoke({
-            "context": context,
-            "question": question
-        })
+            # Generate the answer
+            generation_chain = prompt | llm | StrOutputParser()
+            generation = generation_chain.invoke({
+                "context": context,
+                "question": question
+            })
 
-        return {
-            "documents": documents,
-            "question": question,
-            "generation": generation
-        }
+            return {
+                "documents": documents,
+                "question": question,
+                "generation": generation
+            }
+        except Exception as e:
+            st.error(f"回答生成中にエラーが発生しました: {str(e)}")
+            return {
+                "documents": documents,
+                "question": question,
+                "generation": f"申し訳ありませんが、回答の生成中にエラーが発生しました: {str(e)}"
+            }
 
 
 def decide_to_generate(state: GraphState) -> str:
@@ -625,7 +719,7 @@ workflow.add_node("retrieve", retrieve)
 workflow.add_node("grade_documents", grade_documents)
 workflow.add_node("generate", generate)
 workflow.add_node("transform_query", transform_query)
-workflow.add_node("web_search_node", web_search_fn)  # Renamed from web_search to web_search_node
+workflow.add_node("web_search_node", web_search_fn)
 
 # Build graph
 workflow.add_edge(START, "retrieve")
@@ -661,74 +755,82 @@ st.sidebar.markdown("---")
 st.sidebar.header("ドキュメントアップロード")
 st.sidebar.markdown(f"サポートされているファイル形式: {', '.join(SUPPORTED_TYPES)}")
 
-uploaded_files = st.sidebar.file_uploader(
-    "ファイルを選択してください",
-    type=SUPPORTED_TYPES,
-    accept_multiple_files=True
-)
+# Only show file uploader if container_client is properly initialized
+if container_client is not None:
+    uploaded_files = st.sidebar.file_uploader(
+        "ファイルを選択してください",
+        type=SUPPORTED_TYPES,
+        accept_multiple_files=True
+    )
 
-if uploaded_files:
-    # Get new files that haven't been uploaded yet
-    new_files = [f for f in uploaded_files if f.name not in st.session_state.uploaded_file_names]
+    if uploaded_files:
+        # Get new files that haven't been uploaded yet
+        new_files = [f for f in uploaded_files if f.name not in st.session_state.uploaded_file_names]
 
-    if new_files:  # Only process new files
-        upload_status = st.empty()
-        for uploaded_file in new_files:
-            if is_valid_file(uploaded_file):
-                upload_status.info(f"{uploaded_file.name} をアップロード中...")
-                result = upload_file_to_blob(uploaded_file, uploaded_file.type)
-                if result["status"] == "success":
-                    st.sidebar.success(result["message"])
-                    # Add to uploaded files set
-                    st.session_state.uploaded_file_names.add(uploaded_file.name)
+        if new_files:  # Only process new files
+            upload_status = st.empty()
+            for uploaded_file in new_files:
+                if is_valid_file(uploaded_file):
+                    upload_status.info(f"{uploaded_file.name} をアップロード中...")
+                    result = upload_file_to_blob(uploaded_file, uploaded_file.type)
+                    if result["status"] == "success":
+                        st.sidebar.success(result["message"])
+                        # Add to uploaded files set
+                        st.session_state.uploaded_file_names.add(uploaded_file.name)
+                    else:
+                        st.sidebar.error(result["message"])
                 else:
-                    st.sidebar.error(result["message"])
-            else:
-                st.sidebar.error(f"未対応のファイル形式です: {uploaded_file.name}")
-        upload_status.empty()
+                    st.sidebar.error(f"未対応のファイル形式です: {uploaded_file.name}")
+            upload_status.empty()
+else:
+    st.sidebar.warning("Azure Blob Storageが設定されていないため、ファイルアップロード機能は無効です。")
 
 question = st.text_input("質問を入力してください:", key="question_input")
 
 if st.button("質問する"):
     if question:
         try:
-            with st.spinner('処理中...'):
-                response = app_chain.invoke({
+            # Check if the required components are initialized
+            if llm is None or retriever is None:
+                st.error("一部の必要なサービスが正しく設定されていないため、質問に回答できません。")
+            else:
+                with st.spinner('処理中...'):
+                    response = app_chain.invoke({
+                        "question": question,
+                        "documents": [],
+                        "generation": "",
+                        "search_results": "No",  # Updated from web_search to search_results
+                        "original_question": question
+                    })
+
+                st.write("### 回答:")
+                st.write(response["generation"])
+
+                if debug_mode:
+                    st.write("### デバッグ情報:")
+                    blob_docs = [doc for doc in response["documents"] if doc.metadata.get('source_type', '') == 'blob']
+                    web_docs = [doc for doc in response["documents"] if doc.metadata.get('source_type', '') == 'web']
+
+                    st.json({
+                        "質問": question,
+                        "ドキュメント数": len(response["documents"]),
+                        "Blob文書数": len(blob_docs),
+                        "Web検索結果数": len(web_docs),
+                        "Web検索実行": response.get("search_results") == "Yes"  # Updated from web_search to search_results
+                    })
+
+                if show_langsmith:
+                    thread_id = str(hash(question))
+                    st.write("### LangSmith トレース情報")
+                    st.markdown(f"""
+                        トレースを確認するには以下のURLにアクセスしてください:
+                        https://smith.langchain.com/public/threads/{thread_id}/
+                    """)
+
+                st.session_state.chat_history.append({
                     "question": question,
-                    "documents": [],
-                    "generation": "",
-                    "search_results": "No",  # Updated from web_search to search_results
-                    "original_question": question
+                    "answer": response["generation"]
                 })
-
-            st.write("### 回答:")
-            st.write(response["generation"])
-
-            if debug_mode:
-                st.write("### デバッグ情報:")
-                blob_docs = [doc for doc in response["documents"] if doc.metadata.get('source_type', '') == 'blob']
-                web_docs = [doc for doc in response["documents"] if doc.metadata.get('source_type', '') == 'web']
-
-                st.json({
-                    "質問": question,
-                    "ドキュメント数": len(response["documents"]),
-                    "Blob文書数": len(blob_docs),
-                    "Web検索結果数": len(web_docs),
-                    "Web検索実行": response.get("search_results") == "Yes"  # Updated from web_search to search_results
-                })
-
-            if show_langsmith:
-                thread_id = str(hash(question))
-                st.write("### LangSmith トレース情報")
-                st.markdown(f"""
-                    トレースを確認するには以下のURLにアクセスしてください:
-                    https://smith.langchain.com/public/threads/{thread_id}/
-                """)
-
-            st.session_state.chat_history.append({
-                "question": question,
-                "answer": response["generation"]
-            })
 
         except Exception as e:
             st.error(f"エラーが発生しました: {str(e)}")
