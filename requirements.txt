@@ -22,8 +22,8 @@ python-magic>=0.4.27     # For Unix-like systems
 # OpenAI
 openai>=1.10.0
 
-# Web Search
-google-search-results>=2.4.2 
+# Add DuckDuckGo Search package
+duckduckgo-search>=4.1.0
 
 # Utilities
 python-dotenv>=1.0.0
